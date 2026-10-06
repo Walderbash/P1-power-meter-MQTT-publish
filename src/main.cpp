@@ -1,19 +1,25 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <ArduinoOTA.h>
 #include "CRC16.h"
 #include <PubSubClient.h>
 #include "config.h"
 
+#ifndef WIFIHOSTNAME
+#define WIFIHOSTNAME "p1-meter"
+#endif
+
 //===Change values from here===
 const char* ssid = SSID;
-const char* password = WIFIPASSWORD;
+const char* wifiPassword = WIFIPASSWORD;
+const char* hostname = WIFIHOSTNAME;
 
 char mqttServer[] =  MQTTSERVER;
 uint16_t port = MQTTPORT; 
 
 char mqttTopic[] = MQTTTOPIC;
 char username[] = MQTTUSERNAME;
-char password[] = MQTTPASSWORD;
+char mqttPassword[] = MQTTPASSWORD;
 char clientId[] = MQTTCLIENT;
 
 
@@ -33,6 +39,7 @@ long mGAS = 0;    //Meter reading Gas
 char telegram[MAXLINELENGTH];
 
 unsigned int currentCRC=0;
+unsigned long lastMqttAttempt = 0;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -46,9 +53,11 @@ void setup() {
   Serial.println("Booting");
 
   WiFi.mode(WIFI_STA); // Define the NodeMCU Wifi mode
+  WiFi.hostname(hostname); // Name of this device on the network (DHCP / router)
+  WiFi.setAutoReconnect(true);
 
   Serial.println("Try to connect to " + String(ssid));
-  WiFi.begin(ssid, password); // Start the Wifi connection
+  WiFi.begin(ssid, wifiPassword); // Start the Wifi connection
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -61,31 +70,48 @@ void setup() {
   mqttClient.setServer(mqttServer, port); // Define the server and port for the Mqtt Client
   mqttClient.setCallback(callback); // Define the callback function for the Mqtt Client. Not used in our case.
 
+  ArduinoOTA.setHostname(hostname);
+#ifdef OTAPASSWORD
+  ArduinoOTA.setPassword(OTAPASSWORD);
+#endif
+  ArduinoOTA.onStart([]() { Serial.println("OTA start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("\nOTA end"); });
+  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA error[%u]\n", error); });
+  ArduinoOTA.begin();
+
   Serial.println("Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 }
 
+// Non-blocking: retries at most every 5 seconds so OTA and telegram reading keep running
+bool mqttConnect() {
+  if (mqttClient.connected()) return true;
+  if (millis() - lastMqttAttempt < 5000) return false;
+  lastMqttAttempt = millis();
+
+  Serial.print("MQTT connection...");
+  if (mqttClient.connect(clientId, username, mqttPassword)) { // Try to connect the Mqtt Client
+    Serial.println("connected");
+    return true;
+  }
+  Serial.print("failed, rc=");
+  Serial.println(mqttClient.state());
+  return false;
+}
+
 void mqttPublish() {
   char payload[255];
 
-  sprintf(payload,
-    "{\"mGAS\":\"%d\",\"mEVLT\":\"%d\",\"mEVHT\":\"%d\",\"mEOLT\":\"%d\",\"mEOHT\":\"%d\",\"mEAV\":\"%d\",\"mEAT\":\"%d\"}"
+  snprintf(payload, sizeof(payload),
+    "{\"mGAS\":\"%ld\",\"mEVLT\":\"%ld\",\"mEVHT\":\"%ld\",\"mEOLT\":\"%ld\",\"mEOHT\":\"%ld\",\"mEAV\":\"%ld\",\"mEAT\":\"%ld\"}"
     ,mGAS, mEVLT, mEVHT, mEOLT, mEOHT, mEAV, mEAT);
 
-  while (!mqttClient.connected()) { // If the Mqtt Client is not connected, so try to connect
-    Serial.print("MQTT connection...");
-    //if (mqttClient.connect(clientId, authMethod, token)) { // Try to connect the Mqtt Client
-    if (mqttClient.connect(clientId, username, password)) { // Try to connect the Mqtt Client
-      Serial.println("connected");
-    } else {
-      Serial.println("failed, rc=" + mqttClient.state());
-      Serial.println(" try again in 1 second");
-      delay(1000);
-    }
+  if (!mqttConnect()) {
+    Serial.println("MQTT not connected, skipping publish");
+    return;
   }
-  //Serial.println("Publishing on " + mqttTopic);
-  mqttClient.publish(mqttTopic, (char*) String(payload).c_str()); // Send a message to IoT Foundation
+  mqttClient.publish(mqttTopic, payload);
 }
 
 bool isNumber(char* res, int len) {
@@ -143,7 +169,7 @@ bool decodeTelegram(int len) {
     currentCRC=CRC16(0x0000,(unsigned char *) telegram+startChar, len-startChar);
     if(outputOnSerial)
     {
-      for(int cnt=startChar; cnt<len-startChar;cnt++)
+      for(int cnt=startChar; cnt<len;cnt++)
         Serial.print(telegram[cnt]);
     }    
     //Serial.println("Start found!");
@@ -153,7 +179,7 @@ bool decodeTelegram(int len) {
   {
     //add to crc calc 
     currentCRC=CRC16(currentCRC,(unsigned char*)telegram+endChar, 1);
-    char messageCRC[4];
+    char messageCRC[5] = {0}; // 4 hex chars + terminator
     strncpy(messageCRC, telegram + endChar + 1, 4);
     if(outputOnSerial)
     {
@@ -228,7 +254,8 @@ void readTelegram() {
   if (Serial.available()) {
     memset(telegram, 0, sizeof(telegram));
     while (Serial.available()) {
-      int len = Serial.readBytesUntil('\n', telegram, MAXLINELENGTH);
+      // leave room for the '\n' and '\0' appended below
+      int len = Serial.readBytesUntil('\n', telegram, MAXLINELENGTH - 2);
       telegram[len] = '\n';
       telegram[len+1] = 0;
       yield();
@@ -241,5 +268,8 @@ void readTelegram() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
+  mqttConnect();
+  mqttClient.loop();
   readTelegram();
 }
